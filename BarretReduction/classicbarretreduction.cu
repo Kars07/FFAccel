@@ -9,7 +9,7 @@ typedef uint64_t fp_wide_t; // Wide type for intermediate calculations
 
 // Device constants
 __device__ __constant__ fp_t PRIME_P;
-__device__ __constant__ fp_t MU;
+__device__ __constant__ uint64_t MU;
 
 // Error checking macro
 #define CUDA_CHECK(call) do { \
@@ -20,19 +20,19 @@ __device__ __constant__ fp_t MU;
     } \
 } while(0)
 
-// Barrett reduction implementation 
+// Barrett reduction implementation
 __device__ __forceinline__ fp_t barrett_reduce(fp_wide_t x) {
-    
+
     const int m = 32; // bit length of prime p (assuming 32-bit prime)
     fp_wide_t c = x >> (m - 1);
     
     fp_wide_t temp = c * MU;
     fp_wide_t quot = temp >> (m + 1);
-    
+
     fp_wide_t rem = x - quot * PRIME_P;
-    
+
     if (rem >= PRIME_P) {
-        
+
         rem = rem - PRIME_P;
 
         if (rem >= PRIME_P) {
@@ -78,7 +78,7 @@ __device__ fp_t fp_pow_barrett(fp_t base, fp_t exp) {
     return result;
 }
 
-// Extended Euclidean Algorithm for modular inverse
+// Extended Euclidean Algorithm for modular inverse (unchanged)
 __device__ fp_t fp_inv_barrett(fp_t a) {
     if (a == 0) {
         return 0; // Invalid input
@@ -185,15 +185,32 @@ __global__ void fp_matrix_mul_barrett(const fp_t* A, const fp_t* B, fp_t* C,
 class FiniteFieldFpBarrett {
 private:
     fp_t p;
-    fp_t mu; // Precomputed Barrett constant
+    uint64_t mu; // Precomputed Barrett constant (needs to be 64-bit)
     
     // Compute Barrett constant μ = ⌊2^(2m)/p⌋
-    fp_t compute_mu(fp_t prime) {
-        // For 32-bit prime, 2m = 64
-        // μ = ⌊2^64/p⌋
-        // Using integer division to compute this
-        uint64_t two_pow_64 = 0xFFFFFFFFFFFFFFFFULL; // 2^64 - 1 (approximation)
-        return (fp_t)(two_pow_64 / prime);
+    uint64_t compute_mu(fp_t prime) {
+        // For Barrett reduction: μ = ⌊2^(2m)/p⌋
+        // where m is the bit length of the prime
+        
+        // Find bit length of prime
+        int m = 0;
+        fp_t temp = prime;
+        while (temp > 0) {
+            m++;
+            temp >>= 1;
+        }
+        
+        // For p = 2147483647 (2^31 - 1), m = 31
+        // μ = ⌊2^(2*31)/p⌋ = ⌊2^62/p⌋
+        
+        // Calculate 2^(2m) / p using double precision
+        double two_pow_2m = 1.0;
+        for (int i = 0; i < 2 * m; i++) {
+            two_pow_2m *= 2.0;
+        }
+        
+        uint64_t mu_result = (uint64_t)(two_pow_2m / (double)prime);
+        return mu_result;
     }
     
 public:
@@ -202,9 +219,9 @@ public:
         
         // Copy prime and mu to device constant memory
         CUDA_CHECK(cudaMemcpyToSymbol(PRIME_P, &p, sizeof(fp_t)));
-        CUDA_CHECK(cudaMemcpyToSymbol(MU, &mu, sizeof(fp_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(MU, &mu, sizeof(uint64_t)));
         
-        printf("Barrett reduction initialized with p = %u, μ = %u\n", p, mu);
+        printf("Barrett reduction initialized with p = %u, μ = %llu\n", p, (unsigned long long)mu);
     }
     
     void add_arrays(const fp_t* h_a, const fp_t* h_b, fp_t* h_result, int n) {
