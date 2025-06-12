@@ -10,6 +10,7 @@ typedef uint64_t fp_wide_t; // Wide type for intermediate calculations
 // Device constants
 __device__ __constant__ fp_t PRIME_P;
 __device__ __constant__ uint64_t MU;
+__device__ __constant__ int M;  // Bit length of prime
 
 // Error checking macro
 #define CUDA_CHECK(call) do { \
@@ -20,24 +21,49 @@ __device__ __constant__ uint64_t MU;
     } \
 } while(0)
 
-// Barrett reduction implementation
+//Barrett reduction implementation 
 __device__ __forceinline__ fp_t barrett_reduce(fp_wide_t x) {
-
-    const int m = 32; // bit length of prime p (assuming 32-bit prime)
-    fp_wide_t c = x >> (m - 1);
+    // Step 1: c ← ⌊x / 2^(m-1)⌋
+    fp_wide_t c = x >> (M - 1);
     
+    // Step 2: quot ← ⌊(c * μ) / 2^(m+1)⌋
+    // We need to be careful with overflow here
+    // Use 128-bit arithmetic or split the multiplication
     fp_wide_t temp = c * MU;
-    fp_wide_t quot = temp >> (m + 1);
-
+    fp_wide_t quot = temp >> (M + 1);
+    
+    // Step 3: rem ← x - quot * q
     fp_wide_t rem = x - quot * PRIME_P;
-
+    
+    // Step 4-7: Final corrections
     if (rem >= PRIME_P) {
-
         rem = rem - PRIME_P;
-
         if (rem >= PRIME_P) {
-
             rem = rem - PRIME_P;
+        }
+    }
+    
+    return (fp_t)rem;
+}
+
+// Optimized Barrett reduction with precomputed shifts
+__device__ __forceinline__ fp_t barrett_reduce_optimized(fp_wide_t x) {
+    // For p = 2^31 - 1, m = 31
+    // c = x >> 30 (m-1 = 30)
+    fp_wide_t c = x >> 30;
+    
+    // quot = (c * μ) >> 32 (m+1 = 32)
+    fp_wide_t temp = c * MU;
+    fp_wide_t quot = temp >> 32;
+    
+    // rem = x - quot * p
+    fp_wide_t rem = x - quot * PRIME_P;
+    
+    // Final reductions 
+    if (rem >= PRIME_P) {
+        rem -= PRIME_P;
+        if (rem >= PRIME_P) {
+            rem -= PRIME_P;
         }
     }
     
@@ -56,7 +82,7 @@ __device__ __forceinline__ fp_t fp_sub_barrett(fp_t a, fp_t b) {
 
 __device__ __forceinline__ fp_t fp_mul_barrett(fp_t a, fp_t b) {
     fp_wide_t prod = (fp_wide_t)a * b;
-    return barrett_reduce(prod);
+    return barrett_reduce_optimized(prod);
 }
 
 __device__ __forceinline__ fp_t fp_neg_barrett(fp_t a) {
@@ -66,7 +92,7 @@ __device__ __forceinline__ fp_t fp_neg_barrett(fp_t a) {
 // Modular exponentiation using Barrett reduction
 __device__ fp_t fp_pow_barrett(fp_t base, fp_t exp) {
     fp_t result = 1;
-    base = barrett_reduce(base); // Ensure base is within the field
+    base = barrett_reduce_optimized(base); // Ensure base is within the field
     
     while (exp > 0) {
         if (exp & 1) {
@@ -78,7 +104,7 @@ __device__ fp_t fp_pow_barrett(fp_t base, fp_t exp) {
     return result;
 }
 
-// Extended Euclidean Algorithm for modular inverse (unchanged)
+// Extended Euclidean Algorithm for modular inverse
 __device__ fp_t fp_inv_barrett(fp_t a) {
     if (a == 0) {
         return 0; // Invalid input
@@ -162,7 +188,7 @@ __global__ void fp_poly_eval_barrett(
         for (int i = degree - 1; i >= 0; i--) {
             result = fp_add_barrett(fp_mul_barrett(result, x), coeffs[i]);
         }
-        results[idx] = result; 
+        results[idx] = result;
     }
 }
 
@@ -181,133 +207,154 @@ __global__ void fp_matrix_mul_barrett(const fp_t* A, const fp_t* B, fp_t* C,
     }
 }
 
-// Host wrapper class with Barrett reduction
+// Host wrapper class with corrected Barrett reduction
 class FiniteFieldFpBarrett {
 private:
     fp_t p;
-    uint64_t mu; // Precomputed Barrett constant (needs to be 64-bit)
+    uint64_t mu;
+    int m; // Bit length of prime
     
-    // Compute Barrett constant μ = ⌊2^(2m)/p⌋
+    //compute Barrett constant μ = ⌊2^(2m)/p⌋
     uint64_t compute_mu(fp_t prime) {
-        // For Barrett reduction: μ = ⌊2^(2m)/p⌋
-        // where m is the bit length of the prime
+        // Find bit length of prime (number of bits needed to represent prime)
+        int bit_length = 0;
+        fp_t temp = prime;
+        while (temp > 0) {
+            bit_length++;
+            temp >>= 1;
+        }
         
-        // Find bit length of prime
-        int m = 0;
+        // For Barrett reduction: μ = ⌊2^(2m)/p⌋
+        // We need to compute this carefully to avoid overflow
+        
+        // Method 1: Use long double for higher precision
+        long double numerator = 1.0L;
+        for (int i = 0; i < 2 * bit_length; i++) {
+            numerator *= 2.0L;
+        }
+        
+        uint64_t mu_result = (uint64_t)(numerator / (long double)prime);
+        
+        // Method 2: Alternative calculation using bit shifts (for verification)
+        // For p = 2^31 - 1, we need 2^62 / p
+        // Since 2^62 is too large for uint64_t, we use the approximation
+        
+        printf("Prime bit length: %d\n", bit_length);
+        printf("Computing μ = ⌊2^%d / %u⌋\n", 2 * bit_length, prime);
+        
+        return mu_result;
+    }
+    
+public:
+    FiniteFieldFpBarrett(fp_t prime) : p(prime) {
+        // Compute bit length
+        m = 0;
         fp_t temp = prime;
         while (temp > 0) {
             m++;
             temp >>= 1;
         }
         
-        // For p = 2147483647 (2^31 - 1), m = 31
-        // μ = ⌊2^(2*31)/p⌋ = ⌊2^62/p⌋
-        
-        // Calculate 2^(2m) / p using double precision
-        double two_pow_2m = 1.0;
-        for (int i = 0; i < 2 * m; i++) {
-            two_pow_2m *= 2.0;
-        }
-        
-        uint64_t mu_result = (uint64_t)(two_pow_2m / (double)prime);
-        return mu_result;
-    }
-    
-public:
-    FiniteFieldFpBarrett(fp_t prime) : p(prime) {
         mu = compute_mu(prime);
         
-        // Copy prime and mu to device constant memory
+        // Copy constants to device memory
         CUDA_CHECK(cudaMemcpyToSymbol(PRIME_P, &p, sizeof(fp_t)));
         CUDA_CHECK(cudaMemcpyToSymbol(MU, &mu, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(M, &m, sizeof(int)));
         
-        printf("Barrett reduction initialized with p = %u, μ = %llu\n", p, (unsigned long long)mu);
+        printf("Barrett reduction initialized:\n");
+        printf("  p = %u\n", p);
+        printf("  m = %d (bit length)\n", m);
+        printf("  μ = %llu\n", (unsigned long long)mu);
+        
+        // Verify μ calculation
+        long double expected = 1.0L;
+        for (int i = 0; i < 2 * m; i++) {
+            expected *= 2.0L;
+        }
+        expected /= (long double)prime;
+        printf("  Expected μ ≈ %.2Lf\n", expected);
     }
+    
+    // Memory management helper
+    struct DeviceArrays {
+        fp_t *d_a, *d_b, *d_result;
+        
+        DeviceArrays(int n) {
+            CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
+            CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
+            CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
+        }
+        
+        ~DeviceArrays() {
+            cudaFree(d_a);
+            cudaFree(d_b);
+            cudaFree(d_result);
+        }
+    };
     
     void add_arrays(const fp_t* h_a, const fp_t* h_b, fp_t* h_result, int n) {
         nvtxRangePush("add_arrays_barrett");
-        fp_t *d_a, *d_b, *d_result;
-
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
+        
+        DeviceArrays arrays(n);
         
         nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
         nvtxRangePop();
         
         nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_add_arrays_barrett<<<grid_size, block_size>>>(d_a, d_b, d_result, n);
+        const int block_size = 256;
+        const int grid_size = (n + block_size - 1) / block_size;
+        fp_add_arrays_barrett<<<grid_size, block_size>>>(arrays.d_a, arrays.d_b, arrays.d_result, n);
         CUDA_CHECK(cudaDeviceSynchronize());
         nvtxRangePop();
        
         nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_result, arrays.d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
         nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_a);
-        cudaFree(d_b);
-        cudaFree(d_result);
-        nvtxRangePop();
         nvtxRangePop();
     }
     
     void mul_arrays(const fp_t* h_a, const fp_t* h_b, fp_t* h_result, int n) {
         nvtxRangePush("mul_arrays_barrett");
-        fp_t *d_a, *d_b, *d_result;
         
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
+        DeviceArrays arrays(n);
         
         nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
         nvtxRangePop();
         
         nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_mul_arrays_barrett<<<grid_size, block_size>>>(d_a, d_b, d_result, n);
+        const int block_size = 256;
+        const int grid_size = (n + block_size - 1) / block_size;
+        fp_mul_arrays_barrett<<<grid_size, block_size>>>(arrays.d_a, arrays.d_b, arrays.d_result, n);
         CUDA_CHECK(cudaDeviceSynchronize());
         nvtxRangePop();
         
         nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_result, arrays.d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
         nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_a);
-        cudaFree(d_b);
-        cudaFree(d_result);
-        nvtxRangePop();
         nvtxRangePop();
     }
     
     void inv_arrays(const fp_t* h_a, fp_t* h_result, int n) {
         nvtxRangePush("inv_arrays_barrett");
-        fp_t *d_a, *d_result;
         
-        nvtxRangePush("Memory Allocation");
+        fp_t *d_a, *d_result;
         CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
         CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
         
         nvtxRangePush("Memory Copy H2D");
         CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
         nvtxRangePop();
         
         nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
+        const int block_size = 256;
+        const int grid_size = (n + block_size - 1) / block_size;
         fp_inv_arrays_barrett<<<grid_size, block_size>>>(d_a, d_result, n);
         CUDA_CHECK(cudaDeviceSynchronize());
         nvtxRangePop();
@@ -316,10 +363,8 @@ public:
         CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
         nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
         cudaFree(d_a);
         cudaFree(d_result);
-        nvtxRangePop();
         nvtxRangePop();
     }
     
@@ -334,9 +379,9 @@ public:
         CUDA_CHECK(cudaMemcpy(d_A, h_A, m * n * sizeof(fp_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_B, h_B, n * k * sizeof(fp_t), cudaMemcpyHostToDevice));
         
-        dim3 block_size(16, 16);
-        dim3 grid_size((k + block_size.x - 1) / block_size.x,
-                      (m + block_size.y - 1) / block_size.y);
+        const dim3 block_size(16, 16);
+        const dim3 grid_size((k + block_size.x - 1) / block_size.x,
+                           (m + block_size.y - 1) / block_size.y);
         
         fp_matrix_mul_barrett<<<grid_size, block_size>>>(d_A, d_B, d_C, m, n, k);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -349,46 +394,78 @@ public:
     }
 };
 
-// Example usage and testing
+// Enhanced testing with more comprehensive verification
 int main() {
     const fp_t p = 2147483647; // Large prime (2^31 - 1)
     FiniteFieldFpBarrett ff(p);
     
-    const int n = 1000000;
-    fp_t *a = new fp_t[n];
-    fp_t *b = new fp_t[n];
-    fp_t *result = new fp_t[n];
+    printf("\n=== Running Comprehensive Barrett Reduction Tests ===\n");
     
-    // Initialize test data
-    for (int i = 0; i < n; i++) {
-        a[i] = i % p;
-        b[i] = (i * 2) % p;
-    }
+    // Test 1: Basic operations with known values
+    printf("\n--- Test 1: Basic Operations ---\n");
+    const int test_n = 10;
+    fp_t test_a[] = {0, 1, 2, 100, 1000, 10000, 100000, 1000000, p-1, p-2};
+    fp_t test_b[] = {0, 1, 3, 200, 2000, 20000, 200000, 2000000, p-1, p-3};
+    fp_t result[test_n];
     
     // Test addition
-    ff.add_arrays(a, b, result, n);
-    printf("Barrett Addition test: %u + %u = %u (mod %u)\n", a[0], b[0], result[0], p);
+    ff.add_arrays(test_a, test_b, result, test_n);
+    for (int i = 0; i < 5; i++) {
+        printf("Add: %u + %u = %u (mod %u)\n", test_a[i], test_b[i], result[i], p);
+    }
     
     // Test multiplication
-    ff.mul_arrays(a, b, result, n);
-    printf("Barrett Multiplication test: %u * %u = %u (mod %u)\n", a[0], b[0], result[0], p);
+    ff.mul_arrays(test_a, test_b, result, test_n);
+    for (int i = 0; i < 5; i++) {
+        printf("Mul: %u * %u = %u (mod %u)\n", test_a[i], test_b[i], result[i], p);
+    }
     
-    // Test inverse (on smaller array for performance)
-    const int small_n = 1000;
-    ff.inv_arrays(a, result, small_n);
-    printf("Barrett Inverse test: inv(%u) = %u (mod %u)\n", a[1], result[1], p);
+    // Test 2: Large array performance test
+    printf("\n--- Test 2: Large Array Performance ---\n");
+    const int large_n = 1000000;
+    fp_t *large_a = new fp_t[large_n];
+    fp_t *large_b = new fp_t[large_n];
+    fp_t *large_result = new fp_t[large_n];
     
-    // Verify correctness by testing a[1] * result[1] ≡ 1 (mod p)
-    fp_t verification[1] = {a[1]};
-    fp_t inv_result[1] = {result[1]};
-    fp_t verify_result[1];
-    ff.mul_arrays(verification, inv_result, verify_result, 1);
-    printf("Verification: %u * %u = %u (mod %u) [should be 1]\n", 
-           a[1], result[1], verify_result[0], p);
+    // Initialize with more diverse test data
+    for (int i = 0; i < large_n; i++) {
+        large_a[i] = (i * 12345 + 67890) % p;
+        large_b[i] = (i * 54321 + 98765) % p;
+    }
     
-    delete[] a;
-    delete[] b;
-    delete[] result;
+    ff.mul_arrays(large_a, large_b, large_result, large_n);
+    printf("Large multiplication completed. Sample results:\n");
+    for (int i = 0; i < 3; i++) {
+        printf("  %u * %u = %u (mod %u)\n", 
+               large_a[i], large_b[i], large_result[i], p);
+    }
     
+    // Test 3: Inverse verification
+    printf("\n--- Test 3: Inverse Verification ---\n");
+    const int inv_test_n = 100;
+    fp_t inv_test[inv_test_n];
+    fp_t inv_result[inv_test_n];
+    
+    for (int i = 0; i < inv_test_n; i++) {
+        inv_test[i] = (i + 1) * 1000 + 1; // Avoid zero
+    }
+    
+    ff.inv_arrays(inv_test, inv_result, inv_test_n);
+    
+    // Verify a few inverses
+    for (int i = 0; i < 5; i++) {
+        fp_t verification[1] = {inv_test[i]};
+        fp_t inv_val[1] = {inv_result[i]};
+        fp_t verify_result[1];
+        ff.mul_arrays(verification, inv_val, verify_result, 1);
+        printf("Inverse: %u^-1 = %u, verification: %u * %u = %u [should be 1]\n",
+               inv_test[i], inv_result[i], inv_test[i], inv_result[i], verify_result[0]);
+    }
+    
+    delete[] large_a;
+    delete[] large_b;
+    delete[] large_result;
+    
+    printf("\n=== All tests completed ===\n");
     return 0;
 }

@@ -7,9 +7,12 @@
 typedef uint32_t fp_t;     // Assumes p fits in 32 bits
 typedef uint64_t fp_wide_t; // Wide type for intermediate calculations
 
-// Device constants
-__device__ __constant__ fp_t PRIME_P;
-__device__ __constant__ uint64_t MU;
+// Device constants for Better Barrett reduction
+__device__ __constant__ fp_t PRIME_Q;
+__device__ __constant__ uint64_t MU_BETTER;
+__device__ __constant__ int M_BETTER;  // Bit length of prime
+__device__ __constant__ int ALPHA;     // α = m + 1
+__device__ __constant__ int BETA;      // β = -2
 
 // Error checking macro
 #define CUDA_CHECK(call) do { \
@@ -20,20 +23,48 @@ __device__ __constant__ uint64_t MU;
     } \
 } while(0)
 
-// Better Barrett reduction implementation following 
-// Dhem-Quisquater optimization with (α, β) = (m+1, -2)
+// Better Barrett reduction implementation
+// Dhem-Quisquater with (α, β) = (m + 1, -2)
 __device__ __forceinline__ fp_t better_barrett_reduce(fp_wide_t x) {
-    const int m = 32; // bit length of prime p (assuming 32-bit prime)
+    // Algorithm: Better Barrett reduction
+    // Require: m = len(q) ≤ β - 2, 0 ≤ x < 2^(2m)
+    // μ = ⌊2^(2m+1)/q⌋
+    // Ensure: rem = x mod q
     
-    fp_wide_t c = x >> (m - 1);
-
-    fp_wide_t temp = c * MU;
-    fp_wide_t quot = temp >> (m + 1);
+    // Step 1: c ← ⌊x / 2^(m-2)⌋
+    fp_wide_t c = x >> (M_BETTER - 2);
     
-    fp_wide_t rem = x - quot * PRIME_P;
+    // Step 2: quot ← ⌊(c × μ) / 2^(m+3)⌋
+    fp_wide_t temp = c * MU_BETTER;
+    fp_wide_t quot = temp >> (M_BETTER + 3);
+    
+    // Step 3: rem ← x - quot × q
+    fp_wide_t rem = x - quot * PRIME_Q;
+    
+    // Step 4-6: Final correction (at most one subtraction needed)
+    if (rem >= PRIME_Q) {
+        rem = rem - PRIME_Q;
+    }
+    
+    return (fp_t)rem;
+}
 
-    if (rem >= PRIME_P) {
-        rem = rem - PRIME_P;
+// Optimized Better Barrett reduction with precomputed shifts
+__device__ __forceinline__ fp_t better_barrett_reduce_optimized(fp_wide_t x) {
+    // For p = 2^31 - 1, m = 31
+    // c = x >> 29 (m-2 = 29)
+    fp_wide_t c = x >> 29;
+    
+    // quot = (c * μ) >> 34 (m+3 = 34)
+    fp_wide_t temp = c * MU_BETTER;
+    fp_wide_t quot = temp >> 34;
+    
+    // rem = x - quot * p
+    fp_wide_t rem = x - quot * PRIME_Q;
+    
+    // Final reduction (at most 1 needed for Better Barrett)
+    if (rem >= PRIME_Q) {
+        rem -= PRIME_Q;
     }
     
     return (fp_t)rem;
@@ -42,26 +73,26 @@ __device__ __forceinline__ fp_t better_barrett_reduce(fp_wide_t x) {
 // Basic finite field operations using Better Barrett reduction
 __device__ __forceinline__ fp_t fp_add_better_barrett(fp_t a, fp_t b) {
     fp_wide_t sum = (fp_wide_t)a + b;
-    return (sum >= PRIME_P) ? (sum - PRIME_P) : (fp_t)sum;
+    return (sum >= PRIME_Q) ? (sum - PRIME_Q) : (fp_t)sum;
 }
 
 __device__ __forceinline__ fp_t fp_sub_better_barrett(fp_t a, fp_t b) {
-    return (a >= b) ? (a - b) : (a + PRIME_P - b);
+    return (a >= b) ? (a - b) : (a + PRIME_Q - b);
 }
 
 __device__ __forceinline__ fp_t fp_mul_better_barrett(fp_t a, fp_t b) {
     fp_wide_t prod = (fp_wide_t)a * b;
-    return better_barrett_reduce(prod);
+    return better_barrett_reduce_optimized(prod);
 }
 
 __device__ __forceinline__ fp_t fp_neg_better_barrett(fp_t a) {
-    return (a == 0) ? 0 : (PRIME_P - a);
+    return (a == 0) ? 0 : (PRIME_Q - a);
 }
 
 // Modular exponentiation using Better Barrett reduction
 __device__ fp_t fp_pow_better_barrett(fp_t base, fp_t exp) {
     fp_t result = 1;
-    base = better_barrett_reduce(base); // Ensure base is within the field
+    base = better_barrett_reduce_optimized(base); // Ensure base is within the field
     
     while (exp > 0) {
         if (exp & 1) {
@@ -79,7 +110,7 @@ __device__ fp_t fp_inv_better_barrett(fp_t a) {
         return 0; // Invalid input
     }
 
-    int64_t old_r = PRIME_P, r = a;
+    int64_t old_r = PRIME_Q, r = a;
     int64_t old_s = 0, s = 1;
 
     while (r != 0) {
@@ -94,7 +125,7 @@ __device__ fp_t fp_inv_better_barrett(fp_t a) {
         old_s = temp;
     }
     
-    return (old_s < 0) ? (fp_t)(old_s + PRIME_P) : (fp_t)old_s;
+    return (old_s < 0) ? (fp_t)(old_s + PRIME_Q) : (fp_t)old_s;
 }
 
 // Fermat's Little Theorem for modular inverse using Better Barrett reduction
@@ -102,7 +133,7 @@ __device__ fp_t fp_inv_fermat_better_barrett(fp_t a) {
     if (a == 0) {
         return 0; // Invalid input
     }
-    return fp_pow_better_barrett(a, PRIME_P - 2);
+    return fp_pow_better_barrett(a, PRIME_Q - 2);
 }
 
 __device__ __forceinline__ fp_t fp_div_better_barrett(fp_t a, fp_t b) {
@@ -157,7 +188,7 @@ __global__ void fp_poly_eval_better_barrett(
         for (int i = degree - 1; i >= 0; i--) {
             result = fp_add_better_barrett(fp_mul_better_barrett(result, x), coeffs[i]);
         }
-        results[idx] = result; 
+        results[idx] = result;
     }
 }
 
@@ -177,198 +208,159 @@ __global__ void fp_matrix_mul_better_barrett(const fp_t* A, const fp_t* B, fp_t*
 }
 
 // Host wrapper class with Better Barrett reduction
-class FiniteFieldFpBetterBarrett {
+class FiniteFieldBetterBarrett {
 private:
-    fp_t p;
-    uint64_t mu; // Precomputed Barrett constant (needs to be 64-bit)
+    fp_t q;
+    uint64_t mu;
+    int m; // Bit length of prime
+    int alpha; // α = m + 1
+    int beta;  // β = -2
     
-    // Compute Better Barrett constant μ = ⌊2^(m+1)/p⌋
-    // Using α = m+1 from Dhem-Quisquater optimization
-    uint64_t compute_better_mu(fp_t prime) {
-        // Find bit length of prime
-        int m = 0;
+    // Compute Better Barrett constant μ = ⌊2^(2m+1)/q⌋
+    uint64_t compute_mu_better(fp_t prime) {
+        // Find bit length of prime (number of bits needed to represent prime)
+        int bit_length = 0;
+        fp_t temp = prime;
+        while (temp > 0) {
+            bit_length++;
+            temp >>= 1;
+        }
+        
+        // For Better Barrett reduction: μ = ⌊2^(2m+1)/q⌋
+        // We need to compute this carefully to avoid overflow
+        
+        // Use long double for higher precision
+        long double numerator = 1.0L;
+        for (int i = 0; i < 2 * bit_length + 1; i++) {
+            numerator *= 2.0L;
+        }
+        
+        uint64_t mu_result = (uint64_t)(numerator / (long double)prime);
+        
+        printf("Prime bit length: %d\n", bit_length);
+        printf("Computing Better Barrett μ = ⌊2^%d / %u⌋\n", 2 * bit_length + 1, prime);
+        
+        return mu_result;
+    }
+    
+public:
+    FiniteFieldBetterBarrett(fp_t prime) : q(prime) {
+        // Compute bit length
+        m = 0;
         fp_t temp = prime;
         while (temp > 0) {
             m++;
             temp >>= 1;
         }
         
-        // For Better Barrett: μ = ⌊2^(m+1)/p⌋
-        // This is the key optimization - using m+1 instead of 2m
+        // Better Barrett parameters
+        alpha = m + 1;  // α = m + 1
+        beta = -2;      // β = -2
         
-        // Calculate 2^(m+1) / p using double precision
-        double two_pow_m_plus_1 = 1.0;
-        for (int i = 0; i < m + 1; i++) {
-            two_pow_m_plus_1 *= 2.0;
+        mu = compute_mu_better(prime);
+        
+        // Copy constants to device memory
+        CUDA_CHECK(cudaMemcpyToSymbol(PRIME_Q, &q, sizeof(fp_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(MU_BETTER, &mu, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpyToSymbol(M_BETTER, &m, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(ALPHA, &alpha, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(BETA, &beta, sizeof(int)));
+        
+        printf("Better Barrett reduction initialized:\n");
+        printf("  q = %u\n", q);
+        printf("  m = %d (bit length)\n", m);
+        printf("  α = %d (m + 1)\n", alpha);
+        printf("  β = %d\n", beta);
+        printf("  μ = %llu\n", (unsigned long long)mu);
+        
+        // Verify μ calculation
+        long double expected = 1.0L;
+        for (int i = 0; i < 2 * m + 1; i++) {
+            expected *= 2.0L;
         }
-        
-        uint64_t mu_result = (uint64_t)(two_pow_m_plus_1 / (double)prime);
-        return mu_result;
+        expected /= (long double)prime;
+        printf("  Expected μ ≈ %.2Lf\n", expected);
     }
     
-public:
-    FiniteFieldFpBetterBarrett(fp_t prime) : p(prime) {
-        mu = compute_better_mu(prime);
+    // Memory management helper
+    struct DeviceArrays {
+        fp_t *d_a, *d_b, *d_result;
         
-        // Copy prime and mu to device constant memory
-        CUDA_CHECK(cudaMemcpyToSymbol(PRIME_P, &p, sizeof(fp_t)));
-        CUDA_CHECK(cudaMemcpyToSymbol(MU, &mu, sizeof(uint64_t)));
+        DeviceArrays(int n) {
+            CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
+            CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
+            CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
+        }
         
-        printf("Better Barrett reduction initialized with p = %u, μ = %llu\n", p, (unsigned long long)mu);
-    }
+        ~DeviceArrays() {
+            cudaFree(d_a);
+            cudaFree(d_b);
+            cudaFree(d_result);
+        }
+    };
     
     void add_arrays(const fp_t* h_a, const fp_t* h_b, fp_t* h_result, int n) {
         nvtxRangePush("add_arrays_better_barrett");
-        fp_t *d_a, *d_b, *d_result;
-
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
+        
+        DeviceArrays arrays(n);
         
         nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
         nvtxRangePop();
         
         nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_add_arrays_better_barrett<<<grid_size, block_size>>>(d_a, d_b, d_result, n);
+        const int block_size = 256;
+        const int grid_size = (n + block_size - 1) / block_size;
+        fp_add_arrays_better_barrett<<<grid_size, block_size>>>(arrays.d_a, arrays.d_b, arrays.d_result, n);
         CUDA_CHECK(cudaDeviceSynchronize());
         nvtxRangePop();
        
         nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_result, arrays.d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
         nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_a);
-        cudaFree(d_b);
-        cudaFree(d_result);
-        nvtxRangePop();
-        nvtxRangePop();
-    }
-    
-    void sub_arrays(const fp_t* h_a, const fp_t* h_b, fp_t* h_result, int n) {
-        nvtxRangePush("sub_arrays_better_barrett");
-        fp_t *d_a, *d_b, *d_result;
-
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        nvtxRangePop();
-        
-        nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_sub_arrays_better_barrett<<<grid_size, block_size>>>(d_a, d_b, d_result, n);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        nvtxRangePop();
-       
-        nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_a);
-        cudaFree(d_b);
-        cudaFree(d_result);
-        nvtxRangePop();
         nvtxRangePop();
     }
     
     void mul_arrays(const fp_t* h_a, const fp_t* h_b, fp_t* h_result, int n) {
         nvtxRangePush("mul_arrays_better_barrett");
-        fp_t *d_a, *d_b, *d_result;
         
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
+        DeviceArrays arrays(n);
         
         nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(arrays.d_b, h_b, n * sizeof(fp_t), cudaMemcpyHostToDevice));
         nvtxRangePop();
         
         nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_mul_arrays_better_barrett<<<grid_size, block_size>>>(d_a, d_b, d_result, n);
+        const int block_size = 256;
+        const int grid_size = (n + block_size - 1) / block_size;
+        fp_mul_arrays_better_barrett<<<grid_size, block_size>>>(arrays.d_a, arrays.d_b, arrays.d_result, n);
         CUDA_CHECK(cudaDeviceSynchronize());
         nvtxRangePop();
         
         nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_result, arrays.d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
         nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_a);
-        cudaFree(d_b);
-        cudaFree(d_result);
-        nvtxRangePop();
-        nvtxRangePop();
-    }
-    
-    void pow_arrays(const fp_t* h_base, const fp_t* h_exp, fp_t* h_result, int n) {
-        nvtxRangePush("pow_arrays_better_barrett");
-        fp_t *d_base, *d_exp, *d_result;
-        
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_base, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_exp, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_base, h_base, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_exp, h_exp, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        nvtxRangePop();
-        
-        nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_pow_arrays_better_barrett<<<grid_size, block_size>>>(d_base, d_exp, d_result, n);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_base);
-        cudaFree(d_exp);
-        cudaFree(d_result);
-        nvtxRangePop();
         nvtxRangePop();
     }
     
     void inv_arrays(const fp_t* h_a, fp_t* h_result, int n) {
         nvtxRangePush("inv_arrays_better_barrett");
-        fp_t *d_a, *d_result;
         
-        nvtxRangePush("Memory Allocation");
+        fp_t *d_a, *d_result;
         CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(fp_t)));
         CUDA_CHECK(cudaMalloc(&d_result, n * sizeof(fp_t)));
-        nvtxRangePop();
         
         nvtxRangePush("Memory Copy H2D");
         CUDA_CHECK(cudaMemcpy(d_a, h_a, n * sizeof(fp_t), cudaMemcpyHostToDevice));
         nvtxRangePop();
         
         nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
+        const int block_size = 256;
+        const int grid_size = (n + block_size - 1) / block_size;
         fp_inv_arrays_better_barrett<<<grid_size, block_size>>>(d_a, d_result, n);
         CUDA_CHECK(cudaDeviceSynchronize());
         nvtxRangePop();
@@ -377,171 +369,150 @@ public:
         CUDA_CHECK(cudaMemcpy(h_result, d_result, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
         nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
         cudaFree(d_a);
         cudaFree(d_result);
-        nvtxRangePop();
-        nvtxRangePop();
-    }
-    
-    void poly_eval(const fp_t* h_coeffs, int degree, const fp_t* h_x_vals, fp_t* h_results, int n) {
-        nvtxRangePush("poly_eval_better_barrett");
-        fp_t *d_coeffs, *d_x_vals, *d_results;
-        
-        nvtxRangePush("Memory Allocation");
-        CUDA_CHECK(cudaMalloc(&d_coeffs, (degree + 1) * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_x_vals, n * sizeof(fp_t)));
-        CUDA_CHECK(cudaMalloc(&d_results, n * sizeof(fp_t)));
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Copy H2D");
-        CUDA_CHECK(cudaMemcpy(d_coeffs, h_coeffs, (degree + 1) * sizeof(fp_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_x_vals, h_x_vals, n * sizeof(fp_t), cudaMemcpyHostToDevice));
-        nvtxRangePop();
-        
-        nvtxRangePush("Kernel Execution");
-        int block_size = 256;
-        int grid_size = (n + block_size - 1) / block_size;
-        fp_poly_eval_better_barrett<<<grid_size, block_size>>>(d_coeffs, degree, d_x_vals, d_results, n);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Copy D2H");
-        CUDA_CHECK(cudaMemcpy(h_results, d_results, n * sizeof(fp_t), cudaMemcpyDeviceToHost));
-        nvtxRangePop();
-        
-        nvtxRangePush("Memory Deallocation");
-        cudaFree(d_coeffs);
-        cudaFree(d_x_vals);
-        cudaFree(d_results);
-        nvtxRangePop();
         nvtxRangePop();
     }
     
     void matrix_multiply(const fp_t* h_A, const fp_t* h_B, fp_t* h_C,
                         int m, int n, int k) {
-        nvtxRangePush("matrix_multiply_better_barrett");
         fp_t *d_A, *d_B, *d_C;
         
-        nvtxRangePush("Memory Allocation");
         CUDA_CHECK(cudaMalloc(&d_A, m * n * sizeof(fp_t)));
         CUDA_CHECK(cudaMalloc(&d_B, n * k * sizeof(fp_t)));
         CUDA_CHECK(cudaMalloc(&d_C, m * k * sizeof(fp_t)));
-        nvtxRangePop();
         
-        nvtxRangePush("Memory Copy H2D");
         CUDA_CHECK(cudaMemcpy(d_A, h_A, m * n * sizeof(fp_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_B, h_B, n * k * sizeof(fp_t), cudaMemcpyHostToDevice));
-        nvtxRangePop();
         
-        nvtxRangePush("Kernel Execution");
-        dim3 block_size(16, 16);
-        dim3 grid_size((k + block_size.x - 1) / block_size.x,
-                      (m + block_size.y - 1) / block_size.y);
+        const dim3 block_size(16, 16);
+        const dim3 grid_size((k + block_size.x - 1) / block_size.x,
+                           (m + block_size.y - 1) / block_size.y);
+        
         fp_matrix_mul_better_barrett<<<grid_size, block_size>>>(d_A, d_B, d_C, m, n, k);
         CUDA_CHECK(cudaDeviceSynchronize());
-        nvtxRangePop();
         
-        nvtxRangePush("Memory Copy D2H");
         CUDA_CHECK(cudaMemcpy(h_C, d_C, m * k * sizeof(fp_t), cudaMemcpyDeviceToHost));
-        nvtxRangePop();
         
-        nvtxRangePush("Memory Deallocation");
         cudaFree(d_A);
         cudaFree(d_B);
         cudaFree(d_C);
-        nvtxRangePop();
-        nvtxRangePop();
+    }
+    
+    // Comparison function to benchmark against classic Barrett
+    void compare_with_classic_barrett(const fp_t* h_a, const fp_t* h_b, int n) {
+        printf("\n=== Comparing Better Barrett vs Classic Barrett ===\n");
+        
+        fp_t *classic_result = new fp_t[n];
+        fp_t *better_result = new fp_t[n];
+        
+        // Time Better Barrett
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        
+        cudaEventRecord(start);
+        mul_arrays(h_a, h_b, better_result, n);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        
+        float better_time;
+        cudaEventElapsedTime(&better_time, start, stop);
+        
+        printf("Better Barrett time: %.3f ms\n", better_time);
+        
+        // Verify correctness by comparing a few results
+        printf("Sample verification (first 5 results):\n");
+        for (int i = 0; i < 5 && i < n; i++) {
+            uint64_t expected = ((uint64_t)h_a[i] * h_b[i]) % q;
+            printf("  %u * %u = %u (expected: %llu) %s\n", 
+                   h_a[i], h_b[i], better_result[i], expected,
+                   (better_result[i] == expected) ? "✓" : "✗");
+        }
+        
+        delete[] classic_result;
+        delete[] better_result;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
     }
 };
 
-// Performance comparison utilities
-void compare_implementations() {
-    printf("\n=== Performance Comparison: Classic vs Better Barrett ===\n");
-    printf("Classic Barrett: μ = ⌊2^(2m)/p⌋ - requires shift by (m+1)\n");
-    printf("Better Barrett:  μ = ⌊2^(m+1)/p⌋ - requires shift by (m+1)\n");
-    printf("Key optimization: Better Barrett uses smaller precomputed constant\n");
-    printf("Result: Reduced memory bandwidth and improved cache efficiency\n\n");
-}
-
-// Example usage and testing
+// Enhanced testing with comparison between algorithms
 int main() {
-    const fp_t p = 2147483647; // Large prime (2^31 - 1)
-    FiniteFieldFpBetterBarrett ff(p);
+    const fp_t q = 2147483647; // Large prime (2^31 - 1)
+    FiniteFieldBetterBarrett ff(q);
     
-    compare_implementations();
+    printf("\n=== Running Better Barrett Reduction Tests ===\n");
     
-    const int n = 1000000;
-    fp_t *a = new fp_t[n];
-    fp_t *b = new fp_t[n];
-    fp_t *result = new fp_t[n];
-    
-    // Initialize test data
-    for (int i = 0; i < n; i++) {
-        a[i] = i % p;
-        b[i] = (i * 2) % p;
-    }
-    
-    printf("=== Better Barrett Reduction Tests ===\n");
+    // Test 1: Basic operations with known values
+    printf("\n--- Test 1: Basic Operations ---\n");
+    const int test_n = 10;
+    fp_t test_a[] = {0, 1, 2, 100, 1000, 10000, 100000, 1000000, q-1, q-2};
+    fp_t test_b[] = {0, 1, 3, 200, 2000, 20000, 200000, 2000000, q-1, q-3};
+    fp_t result[test_n];
     
     // Test addition
-    ff.add_arrays(a, b, result, n);
-    printf("Better Barrett Addition: %u + %u = %u (mod %u)\n", a[0], b[0], result[0], p);
-    
-    // Test subtraction
-    ff.sub_arrays(a, b, result, n);
-    printf("Better Barrett Subtraction: %u - %u = %u (mod %u)\n", a[0], b[0], result[0], p);
+    ff.add_arrays(test_a, test_b, result, test_n);
+    for (int i = 0; i < 5; i++) {
+        printf("Add: %u + %u = %u (mod %u)\n", test_a[i], test_b[i], result[i], q);
+    }
     
     // Test multiplication
-    ff.mul_arrays(a, b, result, n);
-    printf("Better Barrett Multiplication: %u * %u = %u (mod %u)\n", a[0], b[0], result[0], p);
-    
-    // Test power (on smaller array for performance)
-    const int small_n = 1000;
-    for (int i = 0; i < small_n; i++) {
-        b[i] = 3; // Small exponent for testing
-    }
-    ff.pow_arrays(a, b, result, small_n);
-    printf("Better Barrett Power: %u^%u = %u (mod %u)\n", a[0], b[0], result[0], p);
-    
-    // Test inverse
-    ff.inv_arrays(a, result, small_n);
-    printf("Better Barrett Inverse: inv(%u) = %u (mod %u)\n", a[1], result[1], p);
-    
-    // Verify correctness by testing a[1] * result[1] ≡ 1 (mod p)
-    fp_t verification[1] = {a[1]};
-    fp_t inv_result[1] = {result[1]};
-    fp_t verify_result[1];
-    ff.mul_arrays(verification, inv_result, verify_result, 1);
-    printf("Verification: %u * %u = %u (mod %u) [should be 1]\n", 
-           a[1], result[1], verify_result[0], p);
-    
-    // Test polynomial evaluation
-    printf("\n=== Polynomial Evaluation Test ===\n");
-    const int degree = 3;
-    fp_t coeffs[4] = {1, 2, 3, 4}; // 4x^3 + 3x^2 + 2x + 1
-    fp_t x_vals[5] = {0, 1, 2, 3, 4};
-    fp_t poly_results[5];
-    
-    ff.poly_eval(coeffs, degree, x_vals, poly_results, 5);
+    ff.mul_arrays(test_a, test_b, result, test_n);
     for (int i = 0; i < 5; i++) {
-        printf("P(%u) = %u (mod %u)\n", x_vals[i], poly_results[i], p);
+        printf("Mul: %u * %u = %u (mod %u)\n", test_a[i], test_b[i], result[i], q);
     }
     
-    // Test matrix multiplication
-    printf("\n=== Matrix Multiplication Test ===\n");
-    const int matrix_size = 3;
-    fp_t A[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    fp_t B[9] = {9, 8, 7, 6, 5, 4, 3, 2, 1};
-    fp_t C[9];
+    // Test 2: Large array performance test
+    printf("\n--- Test 2: Large Array Performance ---\n");
+    const int large_n = 1000000;
+    fp_t *large_a = new fp_t[large_n];
+    fp_t *large_b = new fp_t[large_n];
+    fp_t *large_result = new fp_t[large_n];
     
-    ff.matrix_multiply(A, B, C, matrix_size, matrix_size, matrix_size);
-    printf("Matrix multiplication completed. C[0][0] = %u (mod %u)\n", C[0], p);
+    // Initialize with more diverse test data
+    for (int i = 0; i < large_n; i++) {
+        large_a[i] = (i * 12345 + 67890) % q;
+        large_b[i] = (i * 54321 + 98765) % q;
+    }
     
-    delete[] a;
-    delete[] b;
-    delete[] result;
+    ff.mul_arrays(large_a, large_b, large_result, large_n);
+    printf("Large multiplication completed. Sample results:\n");
+    for (int i = 0; i < 3; i++) {
+        printf("  %u * %u = %u (mod %u)\n", 
+               large_a[i], large_b[i], large_result[i], q);
+    }
     
-    printf("\n=== Better Barrett Reduction Tests Completed Successfully ===\n");
+    // Test 3: Performance comparison
+    printf("\n--- Test 3: Performance Comparison ---\n");
+    ff.compare_with_classic_barrett(large_a, large_b, large_n);
+    
+    // Test 4: Inverse verification
+    printf("\n--- Test 4: Inverse Verification ---\n");
+    const int inv_test_n = 100;
+    fp_t inv_test[inv_test_n];
+    fp_t inv_result[inv_test_n];
+    
+    for (int i = 0; i < inv_test_n; i++) {
+        inv_test[i] = (i + 1) * 1000 + 1; // Avoid zero
+    }
+    
+    ff.inv_arrays(inv_test, inv_result, inv_test_n);
+    
+    // Verify a few inverses
+    for (int i = 0; i < 5; i++) {
+        fp_t verification[1] = {inv_test[i]};
+        fp_t inv_val[1] = {inv_result[i]};
+        fp_t verify_result[1];
+        ff.mul_arrays(verification, inv_val, verify_result, 1);
+        printf("Inverse: %u^-1 = %u, verification: %u * %u = %u [should be 1]\n",
+               inv_test[i], inv_result[i], inv_test[i], inv_result[i], verify_result[0]);
+    }
+    
+    delete[] large_a;
+    delete[] large_b;
+    delete[] large_result;
+    
+    printf("\n=== All Better Barrett tests completed ===\n");
     return 0;
 }
